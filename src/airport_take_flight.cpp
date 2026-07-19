@@ -1,7 +1,6 @@
 #include "airport_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/types/vector.hpp"
-#include "duckdb/common/vector/flat_vector.hpp"
 
 // Arrow includes.
 #include <arrow/flight/client.h>
@@ -95,6 +94,7 @@ namespace duckdb
       vector<string> &names,
       // So rather than the cached_flight_info_ptr here we can just have the cached schema.
       std::shared_ptr<arrow::Schema> schema,
+      const int64_t estimated_records_hint,
       const std::optional<AirportTableFunctionFlightInfoParameters> &table_function_parameters,
       const AirportTableEntry *table_entry)
   {
@@ -115,7 +115,7 @@ namespace duckdb
     airport_add_normal_headers(call_options, take_flight_params, trace_uuid,
                                descriptor);
 
-    int64_t estimated_records = -1;
+    int64_t estimated_records = estimated_records_hint;
 
     // If we are applying time travel, the schema that we have is the latest schema
     // but back in time the schema may have been different.
@@ -243,7 +243,7 @@ namespace duckdb
         params,
         descriptor,
         context,
-        input, return_types, names, nullptr, std::nullopt, nullptr);
+        input, return_types, names, nullptr, -1, std::nullopt, nullptr);
   }
 
   static unique_ptr<FunctionData> take_flight_bind_with_pointer(
@@ -289,6 +289,7 @@ namespace duckdb
         return_types,
         names,
         info->schema(),
+        info->total_records(),
         std::nullopt,
         table_entry);
   }

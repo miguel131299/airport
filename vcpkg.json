@@ -1,4 +1,5 @@
 {
+  "builtin-baseline": "aa2d37682e3318d93aef87efa7b0e88e81cd3d59",
   "vcpkg-configuration": {
     "overlay-ports": [
       "./extension-ci-tools/vcpkg_ports"

@@ -129,10 +129,12 @@ namespace duckdb
         const arrow::flight::FlightDescriptor descriptor,
         const std::shared_ptr<arrow::Schema> schema,
         const std::string server_location,
-        const AirportSerializedFlightAppMetadata parsed_app_metadata)
+        const AirportSerializedFlightAppMetadata parsed_app_metadata,
+        const int64_t total_records = -1)
         : AirportLocationDescriptor(std::move(server_location), std::move(descriptor)),
           schema_(std::move(schema)),
-          parsed_app_metadata_(std::move(parsed_app_metadata))
+          parsed_app_metadata_(std::move(parsed_app_metadata)),
+          total_records_(total_records)
     {
       if (parsed_app_metadata_.input_schema.has_value())
       {
@@ -186,6 +188,11 @@ namespace duckdb
       return input_schema_;
     }
 
+    int64_t total_records() const
+    {
+      return total_records_;
+    }
+
     static std::shared_ptr<arrow::Schema> GetSchema(
         const std::string &server_location,
         const arrow::flight::FlightInfo &flight_info)
@@ -204,6 +211,7 @@ namespace duckdb
     std::shared_ptr<arrow::Schema> input_schema_;
     const std::shared_ptr<arrow::Schema> schema_;
     const AirportSerializedFlightAppMetadata parsed_app_metadata_;
+    const int64_t total_records_;
   };
 
   struct AirportAPITable : AirportAPIObjectBase
@@ -212,12 +220,14 @@ namespace duckdb
         const std::string &server_location,
         const arrow::flight::FlightDescriptor &descriptor,
         const std::shared_ptr<arrow::Schema> &schema,
-        const AirportSerializedFlightAppMetadata &parsed_app_metadata)
+        const AirportSerializedFlightAppMetadata &parsed_app_metadata,
+        const int64_t total_records = -1)
         : AirportAPIObjectBase(
               descriptor,
               schema,
               server_location,
-              parsed_app_metadata)
+              parsed_app_metadata,
+              total_records)
     {
     }
 

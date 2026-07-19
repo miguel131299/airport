@@ -5,7 +5,7 @@
 
 #include "airport_flight_stream.hpp"
 #include "airport_schema_utils.hpp"
-#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/planner/table_filter.hpp"
 
 namespace duckdb
 {
@@ -109,6 +109,7 @@ namespace duckdb
       vector<LogicalType> &return_types,
       vector<string> &names,
       std::shared_ptr<arrow::Schema> schema,
+      const int64_t estimated_records_hint,
       const std::optional<AirportTableFunctionFlightInfoParameters> &table_function_parameters,
       const AirportTableEntry *table_entry);
 

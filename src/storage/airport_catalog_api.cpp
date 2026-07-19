@@ -433,6 +433,7 @@ namespace duckdb
                                            const string &server_location,
                                            const flight::FlightDescriptor &descriptor,
                                            std::shared_ptr<arrow::Schema> schema,
+                                           const int64_t total_records,
                                            const unique_ptr<AirportSchemaContents> &contents)
     {
       auto parsed_app_metadata = ParseFlightAppMetadata(app_metadata, server_location);
@@ -453,7 +454,8 @@ namespace duckdb
             server_location,
             descriptor,
             schema,
-            parsed_app_metadata));
+            parsed_app_metadata,
+            total_records));
       }
       else if (type == "table_function")
       {
@@ -544,7 +546,7 @@ namespace duckdb
 
           handle_flight_app_metadata(app_metadata, catalog, schema, server_location,
                                      flight_info->descriptor(),
-                                     output_schema, contents);
+                                     output_schema, flight_info->total_records(), contents);
         }
       }
 
@@ -575,7 +577,7 @@ namespace duckdb
         if (!app_metadata.empty())
         {
           auto output_schema = AirportAPIObjectBase::GetSchema(server_location, *flight_info);
-          handle_flight_app_metadata(app_metadata, catalog, schema, server_location, flight_info->descriptor(), output_schema, contents);
+          handle_flight_app_metadata(app_metadata, catalog, schema, server_location, flight_info->descriptor(), output_schema, flight_info->total_records(), contents);
         }
         AIRPORT_ASSIGN_OR_RAISE_LOCATION(flight_info, listing->Next(), server_location, "");
       }

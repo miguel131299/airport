@@ -302,6 +302,7 @@ namespace duckdb
         function_info.function->descriptor(),
         context,
         input, return_types, names, nullptr,
+        -1,
         tf_params,
         nullptr);
   }

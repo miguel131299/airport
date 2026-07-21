@@ -270,6 +270,11 @@ namespace duckdb
     // Set the catalog name from the table entry's catalog.
     auto &airport_catalog = table_entry->GetCatalog().Cast<AirportCatalog>();
     params.set_catalog_name(airport_catalog.internal_name());
+    if (airport_catalog.attach_parameters()->max_endpoints() > 1)
+    {
+      params.add_header("x-fbl-max-endpoints",
+                        std::to_string(airport_catalog.attach_parameters()->max_endpoints()));
+    }
 
     // The transaction identifier is passed as the 2nd argument.
     if (!input.inputs[2].IsNull())
@@ -819,8 +824,6 @@ namespace duckdb
                                    AirportArrowScanLocalState &local_state,
                                    const flight::FlightEndpoint endpoint)
   {
-    auto flight_client = AirportAPI::FlightClientForLocation(bind_data.server_location());
-
     if (endpoint.locations.empty())
     {
       throw AirportFlightException(bind_data.server_location(), "No locations specified in flight endpoint");
@@ -983,15 +986,6 @@ namespace duckdb
 
     else
     {
-      if (location != flight::Location::ReuseConnection())
-      {
-        AIRPORT_ASSIGN_OR_RAISE_LOCATION(flight_client,
-                                         flight::FlightClient::Connect(location),
-                                         location.ToString(),
-                                         "");
-        server_location = bind_data.server_location();
-      }
-
       const auto &descriptor = bind_data.descriptor();
 
       arrow::flight::FlightCallOptions call_options;
@@ -1008,13 +1002,40 @@ namespace duckdb
         call_options.headers.emplace_back("airport-skip-producing-results", "1");
       }
 
-      AIRPORT_ASSIGN_OR_RAISE_CONTAINER(
-          auto stream,
-          flight_client->DoGet(
-              call_options,
-              endpoint.ticket),
-          &bind_data,
-          "");
+      vector<string> location_errors;
+      bool opened = false;
+      for (const auto &candidate_location : endpoint.locations)
+      {
+        auto candidate_client = AirportAPI::FlightClientForLocation(bind_data.server_location());
+        if (candidate_location != flight::Location::ReuseConnection())
+        {
+          auto connect_result = flight::FlightClient::Connect(candidate_location);
+          if (!connect_result.ok())
+          {
+            location_errors.push_back(candidate_location.ToString() + ": connect: " +
+                                      connect_result.status().ToString());
+            continue;
+          }
+          candidate_client = std::move(connect_result).ValueOrDie();
+        }
+
+        auto stream_result = candidate_client->DoGet(call_options, endpoint.ticket);
+        if (!stream_result.ok())
+        {
+          location_errors.push_back(candidate_location.ToString() + ": DoGet: " +
+                                    stream_result.status().ToString());
+          continue;
+        }
+        local_state.set_reader(std::move(stream_result).ValueOrDie());
+        opened = true;
+        break;
+      }
+      if (!opened)
+      {
+        throw AirportFlightException(
+            bind_data.server_location(),
+            "All advertised locations failed before opening DoGet: " + StringUtil::Join(location_errors, "; "));
+      }
 
       // FIXME: make sure that the schema returned from the server is the same as
       // what we were expecting.
@@ -1024,7 +1045,6 @@ namespace duckdb
       // callback doesn't have a reference to the local state.
 
       // Can we reuse the chunk?
-      local_state.set_reader(std::move(stream));
     }
 
     if (!std::holds_alternative<std::shared_ptr<AirportLocalScanData>>(local_state.reader()))

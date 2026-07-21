@@ -11,8 +11,10 @@ namespace duckdb
 
   struct AirportAttachParameters
   {
-    AirportAttachParameters(const string &location, const string &auth_token, const string &secret_name, const string &criteria)
-        : location_(location), auth_token_(auth_token), secret_name_(secret_name), criteria_(criteria)
+    AirportAttachParameters(const string &location, const string &auth_token, const string &secret_name, const string &criteria,
+                            idx_t max_endpoints)
+        : location_(location), auth_token_(auth_token), secret_name_(secret_name), criteria_(criteria),
+          max_endpoints_(max_endpoints)
     {
     }
 
@@ -36,6 +38,11 @@ namespace duckdb
       return criteria_;
     }
 
+    idx_t max_endpoints() const
+    {
+      return max_endpoints_;
+    }
+
   private:
     // The location of the flight server.
     string location_;
@@ -45,6 +52,8 @@ namespace duckdb
     string secret_name_;
     // The criteria to pass to the flight server when listing flights.
     string criteria_;
+    // Maximum number of Flight endpoints requested for each catalog scan.
+    idx_t max_endpoints_;
   };
 
   class AirportClearCacheFunction : public TableFunction

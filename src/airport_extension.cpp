@@ -17,6 +17,9 @@
 #include "airport_logging.hpp"
 #include "query_farm_telemetry.hpp"
 
+#include <charconv>
+#include <limits>
+
 #define AIRPORT_EXTENSION_VERSION "2026010801"
 
 namespace duckdb
@@ -112,6 +115,22 @@ namespace duckdb
         string secret_name;
         string auth_token;
         string location;
+        idx_t max_endpoints = 1;
+
+        const auto parse_max_endpoints = [](const string &raw_value) -> idx_t
+        {
+            uint64_t parsed = 0;
+            const auto *begin = raw_value.data();
+            const auto *end = begin + raw_value.size();
+            const auto result = std::from_chars(begin, end, parsed);
+            if (result.ec != std::errc() || result.ptr != end || parsed == 0 ||
+                parsed > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+            {
+                throw BinderException("Airport MAX_ENDPOINTS must be a positive integer no greater than %d",
+                                      std::numeric_limits<int>::max());
+            }
+            return static_cast<idx_t>(parsed);
+        };
 
         string db_name = info.path;
 
@@ -131,6 +150,10 @@ namespace duckdb
                 else if (lower_name == "auth_token")
                 {
                     auth_token = entry.second;
+                }
+                else if (lower_name == "max_endpoints")
+                {
+                    max_endpoints = parse_max_endpoints(entry.second);
                 }
                 else
                 {
@@ -159,6 +182,10 @@ namespace duckdb
             {
                 location = entry.second.ToString();
             }
+            else if (lower_name == "max_endpoints")
+            {
+                max_endpoints = parse_max_endpoints(entry.second.ToString());
+            }
             else
             {
                 throw BinderException("Unrecognized option for Airport ATTACH: %s", entry.first);
@@ -172,7 +199,8 @@ namespace duckdb
             throw BinderException("No location provided for Airport ATTACH.");
         }
 
-        return make_uniq<AirportCatalog>(db, db_name, options.access_mode, AirportAttachParameters(location, auth_token, secret_name, ""));
+        return make_uniq<AirportCatalog>(db, db_name, options.access_mode,
+                                         AirportAttachParameters(location, auth_token, secret_name, "", max_endpoints));
     }
 
     static unique_ptr<TransactionManager> CreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info, AttachedDatabase &db,

@@ -136,15 +136,32 @@ bool OptimizeAirportAggregate(OptimizerExtensionInput &input, unique_ptr<Logical
 	}
 	auto &aggregate = op->Cast<LogicalAggregate>();
 	if (!aggregate.groups.empty() || !aggregate.grouping_functions.empty() || aggregate.children.size() != 1 ||
-	    aggregate.children[0]->type != LogicalOperatorType::LOGICAL_GET) {
+	    (aggregate.children[0]->type != LogicalOperatorType::LOGICAL_GET &&
+	     aggregate.children[0]->type != LogicalOperatorType::LOGICAL_FILTER)) {
 		return false;
 	}
-	auto &get = aggregate.children[0]->Cast<LogicalGet>();
-	if (get.function.name != "airport_take_flight" || !get.table_filters.filters.empty()) {
+	LogicalFilter *residual_filter = nullptr;
+	LogicalOperator *scan_child = aggregate.children[0].get();
+	if (scan_child->type == LogicalOperatorType::LOGICAL_FILTER) {
+		residual_filter = &scan_child->Cast<LogicalFilter>();
+		if (residual_filter->children.size() != 1 ||
+		    residual_filter->children[0]->type != LogicalOperatorType::LOGICAL_GET) {
+			return false;
+		}
+		scan_child = residual_filter->children[0].get();
+	}
+	auto &get = scan_child->Cast<LogicalGet>();
+	if (get.function.name != "airport_take_flight") {
 		return false;
 	}
 	auto &bind_data = get.bind_data->Cast<AirportTakeFlightBindData>();
 	if (!bind_data.fbl_projection_pushdown || !bind_data.fbl_exact_filter_pushdown) {
+		return false;
+	}
+	if (!get.table_filters.filters.empty() && !bind_data.fbl_filters_exact) {
+		return false;
+	}
+	if (residual_filter && !bind_data.fbl_filters_exact) {
 		return false;
 	}
 
@@ -225,6 +242,13 @@ bool OptimizeAirportAggregate(OptimizerExtensionInput &input, unique_ptr<Logical
 	bind_data.fbl_aggregates = std::move(specs);
 	bind_data.fbl_scan_column_ids = std::move(source_column_ids);
 	bind_data.require_exact_filters = true;
+	get.table_filters.filters.clear();
+	if (residual_filter) {
+		// This extension runs after DuckDB's common-subexpression pass. Keeping
+		// the residual until now prevents query09's five BETWEEN ranges from
+		// being deduplicated as identical Airport scans.
+		aggregate.children[0] = std::move(residual_filter->children[0]);
+	}
 	bind_data.set_schema(arrow::schema(std::move(partial_fields)));
 	bind_data.arrow_table = AirportArrowTableSchema();
 	bind_data.all_types.clear();

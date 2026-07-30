@@ -326,6 +326,23 @@ namespace duckdb
       stream_ = stream;
     }
 
+    void set_flight_output_schema(std::shared_ptr<arrow::Schema> schema,
+                                  unique_ptr<AirportArrowTableSchema> arrow_table)
+    {
+      flight_output_schema_ = std::move(schema);
+      flight_output_arrow_table_ = std::move(arrow_table);
+    }
+
+    const std::shared_ptr<arrow::Schema> &flight_output_schema() const
+    {
+      return flight_output_schema_;
+    }
+
+    const arrow_column_map_t &flight_output_columns(const AirportArrowTableSchema &fallback) const
+    {
+      return flight_output_arrow_table_ ? flight_output_arrow_table_->GetColumns() : fallback.GetColumns();
+    }
+
     const TableFunctionInitInput &input() const
     {
       return input_;
@@ -337,6 +354,8 @@ namespace duckdb
     ReaderDelegate reader_;
 
     shared_ptr<ArrowArrayStreamWrapper> stream_;
+    std::shared_ptr<arrow::Schema> flight_output_schema_;
+    unique_ptr<AirportArrowTableSchema> flight_output_arrow_table_;
     const TableFunctionInitInput input_;
   };
 
@@ -381,6 +400,7 @@ namespace duckdb
     // and the per-attach rollback switch have allowed them.
     bool fbl_projection_pushdown = false;
     bool fbl_exact_filter_pushdown = false;
+    bool fbl_filters_exact = false;
     std::vector<std::string> fbl_partial_aggregates;
     bool require_exact_filters = false;
     std::vector<FblAggregate> fbl_aggregates;

@@ -412,9 +412,8 @@ namespace duckdb
     auto &state = data_p.local_state->Cast<AirportArrowScanLocalState>();
     auto &global_state = data_p.global_state->Cast<AirportArrowScanGlobalState>();
     auto &airport_bind_data = data_p.bind_data->CastNoConst<AirportTakeFlightBindData>();
-    auto &reader = state.reader();
 
-    D_ASSERT(!std::holds_alternative<std::shared_ptr<AirportLocalScanData>>(reader));
+    D_ASSERT(!std::holds_alternative<std::shared_ptr<AirportLocalScanData>>(state.reader()));
 
     const auto &array_length = (idx_t)state.chunk->arrow_array.length;
 
@@ -432,7 +431,7 @@ namespace duckdb
       if (output_size > 0)
       {
         ArrowTableFunction::ArrowToDuckDB(state,
-                                          airport_bind_data.arrow_table.GetColumns(),
+                                          state.flight_output_columns(airport_bind_data.arrow_table),
                                           state.all_columns,
                                           false,
                                           airport_bind_data.rowid_column_index);
@@ -445,7 +444,7 @@ namespace duckdb
       if (output_size > 0)
       {
         ArrowTableFunction::ArrowToDuckDB(state,
-                                          airport_bind_data.arrow_table.GetColumns(),
+                                          state.flight_output_columns(airport_bind_data.arrow_table),
                                           output,
                                           false,
                                           airport_bind_data.rowid_column_index);
@@ -625,15 +624,18 @@ namespace duckdb
 
     auto &bind_data = bind_data_p->Cast<AirportTakeFlightBindData>();
 
-    bind_data.json_filters = json_result;
-    if (bind_data.fbl_exact_filter_pushdown && !filters.empty() &&
-        std::all_of(filters.begin(), filters.end(),
-                    [&](const unique_ptr<Expression> &filter)
-                    { return is_exact_filter(*filter); }))
+    if (!filters.empty())
     {
-      bind_data.require_exact_filters = true;
-      filters.clear();
+      bind_data.json_filters = json_result;
+      bind_data.fbl_filters_exact =
+          bind_data.fbl_exact_filter_pushdown &&
+          std::all_of(filters.begin(), filters.end(),
+                      [&](const unique_ptr<Expression> &filter)
+                      { return is_exact_filter(*filter); });
     }
+    // Keep normal DuckDB filters as a correctness backstop. The post-optimizer
+    // aggregate rewrite removes them only after CSE has seen their distinct
+    // constants; clearing here makes query09's five ranges look identical.
   }
 
   shared_ptr<ArrowArrayStreamWrapper> AirportProduceArrowScan(
@@ -1125,7 +1127,32 @@ namespace duckdb
                                     stream_result.status().ToString());
           continue;
         }
-        local_state.set_reader(std::move(stream_result).ValueOrDie());
+        auto flight_reader = std::move(stream_result).ValueOrDie();
+        AIRPORT_ASSIGN_OR_RAISE_LOCATION(
+            auto output_schema,
+            flight_reader->GetSchema(),
+            candidate_location.ToString(),
+            "DoGet output schema");
+        ArrowSchemaWrapper output_schema_root;
+        AIRPORT_ARROW_ASSERT_OK_LOCATION(
+            ExportSchema(*output_schema, &output_schema_root.arrow_schema),
+            candidate_location.ToString(),
+            "export DoGet output schema");
+        auto output_arrow_table = make_uniq<AirportArrowTableSchema>();
+        vector<LogicalType> output_types;
+        vector<string> output_names;
+        idx_t output_rowid_column_index = COLUMN_IDENTIFIER_ROW_ID;
+        AirportExamineSchema(context,
+                             output_schema_root,
+                             output_arrow_table.get(),
+                             &output_types,
+                             &output_names,
+                             nullptr,
+                             &output_rowid_column_index,
+                             true);
+        local_state.set_flight_output_schema(std::move(output_schema),
+                                             std::move(output_arrow_table));
+        local_state.set_reader(std::move(flight_reader));
         opened = true;
         break;
       }
@@ -1155,7 +1182,9 @@ namespace duckdb
                                   bind_data.get_progress_counter(0),
                                   // No need for the last metadata message.
                                   nullptr,
-                                  bind_data.schema(),
+                                  local_state.flight_output_schema()
+                                      ? local_state.flight_output_schema()
+                                      : bind_data.schema(),
                                   bind_data,
                                   local_state));
     }
@@ -1165,7 +1194,29 @@ namespace duckdb
       local_state.set_stream(nullptr);
     }
 
-    local_state.column_ids = input.column_ids;
+    if (bind_data.fbl_projection_pushdown &&
+        local_state.flight_output_schema())
+    {
+      // The negotiated Flight stream is already physically narrowed and its
+      // Arrow children are numbered 0..N-1. DuckDB's original column_ids still
+      // refer to positions in the full table schema; passing those into
+      // ArrowToDuckDB indexes beyond the narrow array and reports
+      // "arrow_scan: array length mismatch".
+      local_state.column_ids.clear();
+      local_state.column_ids.reserve(
+          local_state.flight_output_schema()->num_fields());
+      for (idx_t column = 0;
+           column < static_cast<idx_t>(
+                        local_state.flight_output_schema()->num_fields());
+           ++column)
+      {
+        local_state.column_ids.push_back(column);
+      }
+    }
+    else
+    {
+      local_state.column_ids = input.column_ids;
+    }
     local_state.filters = (TableFilterSet *)input.filters.get();
 
     // Projection pushdown is always enabled.

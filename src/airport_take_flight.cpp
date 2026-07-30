@@ -14,6 +14,11 @@
 
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "airport_flight_exception.hpp"
 #include "airport_flight_statistics.hpp"
@@ -212,6 +217,18 @@ namespace duckdb
         descriptor,
         table_entry,
         nullptr);
+
+    if (table_entry != nullptr)
+    {
+      auto &catalog = table_entry->GetCatalog().Cast<AirportCatalog>();
+      if (catalog.attach_parameters()->fbl_pushdown_enabled())
+      {
+        const auto &capabilities = table_entry->table_data->fbl_capabilities();
+        ret->fbl_projection_pushdown = capabilities.projection_pushdown;
+        ret->fbl_exact_filter_pushdown = capabilities.exact_filter_pushdown;
+        ret->fbl_partial_aggregates = capabilities.partial_aggregates;
+      }
+    }
 
     AirportExamineSchema(context,
                          ret->schema_root,
@@ -519,6 +536,51 @@ namespace duckdb
   void AirportTakeFlightComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                               vector<unique_ptr<Expression>> &filters)
   {
+    const auto is_column_and_constant = [](const Expression &left, const Expression &right)
+    {
+      return left.expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+             right.expression_class == ExpressionClass::BOUND_CONSTANT;
+    };
+    std::function<bool(const Expression &)> is_exact_filter;
+    is_exact_filter = [&](const Expression &expression)
+    {
+      switch (expression.expression_class)
+      {
+      case ExpressionClass::BOUND_COMPARISON:
+      {
+        const auto &comparison = expression.Cast<BoundComparisonExpression>();
+        const auto supported_operator =
+            comparison.type == ExpressionType::COMPARE_EQUAL ||
+            comparison.type == ExpressionType::COMPARE_NOTEQUAL ||
+            comparison.type == ExpressionType::COMPARE_LESSTHAN ||
+            comparison.type == ExpressionType::COMPARE_LESSTHANOREQUALTO ||
+            comparison.type == ExpressionType::COMPARE_GREATERTHAN ||
+            comparison.type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+        return supported_operator &&
+               (is_column_and_constant(*comparison.left, *comparison.right) ||
+                is_column_and_constant(*comparison.right, *comparison.left));
+      }
+      case ExpressionClass::BOUND_BETWEEN:
+      {
+        const auto &between = expression.Cast<BoundBetweenExpression>();
+        return between.input->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+               between.lower->expression_class == ExpressionClass::BOUND_CONSTANT &&
+               between.upper->expression_class == ExpressionClass::BOUND_CONSTANT;
+      }
+      case ExpressionClass::BOUND_CONJUNCTION:
+      {
+        const auto &conjunction = expression.Cast<BoundConjunctionExpression>();
+        if (conjunction.type != ExpressionType::CONJUNCTION_AND || conjunction.children.empty())
+          return false;
+        return std::all_of(conjunction.children.begin(), conjunction.children.end(),
+                           [&](const unique_ptr<Expression> &child)
+                           { return is_exact_filter(*child); });
+      }
+      default:
+        return false;
+      }
+    };
+
     auto allocator = AirportJSONAllocator(BufferAllocator::Get(context));
 
     auto alc = allocator.GetYYAlc();
@@ -564,6 +626,14 @@ namespace duckdb
     auto &bind_data = bind_data_p->Cast<AirportTakeFlightBindData>();
 
     bind_data.json_filters = json_result;
+    if (bind_data.fbl_exact_filter_pushdown && !filters.empty() &&
+        std::all_of(filters.begin(), filters.end(),
+                    [&](const unique_ptr<Expression> &filter)
+                    { return is_exact_filter(*filter); }))
+    {
+      bind_data.require_exact_filters = true;
+      filters.clear();
+    }
   }
 
   shared_ptr<ArrowArrayStreamWrapper> AirportProduceArrowScan(
@@ -632,8 +702,18 @@ namespace duckdb
   {
     struct AirportEndpointParameters
     {
+      struct Aggregate
+      {
+        std::string function;
+        std::optional<idx_t> input_column;
+        MSGPACK_DEFINE_MAP(function, input_column)
+      };
+
       std::string json_filters;
       std::vector<idx_t> column_ids;
+      bool projected_result = false;
+      bool require_exact_filters = false;
+      std::vector<Aggregate> aggregates;
 
       // The parameters to the table function, which should
       // be included in the opaque ticket data returned
@@ -644,7 +724,8 @@ namespace duckdb
       std::string at_unit;
       std::string at_value;
 
-      MSGPACK_DEFINE_MAP(json_filters, column_ids, table_function_parameters, table_function_input_schema, at_unit, at_value)
+      MSGPACK_DEFINE_MAP(json_filters, column_ids, projected_result, require_exact_filters, aggregates,
+                         table_function_parameters, table_function_input_schema, at_unit, at_value)
     };
 
     // static string BuildCompressedTicketMetadata(const string &json_filters, const vector<idx_t> &column_ids, uint32_t *uncompressed_length, const string &location, const flight::FlightDescriptor &descriptor)
@@ -677,7 +758,10 @@ namespace duckdb
         const flight::FlightDescriptor &descriptor,
         const std::shared_ptr<flight::FlightClient> &flight_client,
         const std::string &json_filters,
-        const vector<idx_t> &column_ids,
+        const std::vector<idx_t> &column_ids,
+        bool projected_result,
+        bool require_exact_filters,
+        const std::vector<AirportTakeFlightBindData::FblAggregate> &aggregates,
         const std::string &table_function_parameters,
         const std::string &table_function_input_schema)
     {
@@ -698,6 +782,12 @@ namespace duckdb
 
       endpoints_request.parameters.json_filters = json_filters;
       endpoints_request.parameters.column_ids = column_ids;
+      endpoints_request.parameters.projected_result = projected_result;
+      endpoints_request.parameters.require_exact_filters = require_exact_filters;
+      for (const auto &aggregate : aggregates)
+      {
+        endpoints_request.parameters.aggregates.push_back({aggregate.function, aggregate.input_column});
+      }
       endpoints_request.parameters.table_function_parameters = table_function_parameters;
       endpoints_request.parameters.table_function_input_schema = table_function_input_schema;
       endpoints_request.parameters.at_unit = take_flight_params.at_unit();
@@ -766,13 +856,22 @@ namespace duckdb
       }
     }
 
+    std::vector<idx_t> endpoint_column_ids;
+    if (bind_data.fbl_aggregates.empty())
+      endpoint_column_ids.assign(input.column_ids.begin(), input.column_ids.end());
+    else
+      endpoint_column_ids = bind_data.fbl_scan_column_ids;
+
     auto result = make_uniq<AirportArrowScanGlobalState>(
         AirportGetFlightEndpoints(bind_data.take_flight_params(),
                                   bind_data.trace_id(),
                                   bind_data.descriptor(),
                                   flight_client,
                                   bind_data.json_filters,
-                                  input.column_ids,
+                                  endpoint_column_ids,
+                                  bind_data.fbl_projection_pushdown,
+                                  bind_data.require_exact_filters,
+                                  bind_data.fbl_aggregates,
                                   bind_data.table_function_parameters().has_value() ? bind_data.table_function_parameters()->parameters : "",
                                   bind_data.table_function_parameters().has_value() ? bind_data.table_function_parameters()->table_input_schema : ""),
         projection_ids,

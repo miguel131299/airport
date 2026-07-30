@@ -343,6 +343,13 @@ namespace duckdb
   struct AirportTakeFlightBindData : public AirportArrowScanFunctionData, public AirportLocationDescriptor
   {
   public:
+    struct FblAggregate
+    {
+      std::string function;
+      std::optional<idx_t> input_column;
+      MSGPACK_DEFINE_MAP(function, input_column)
+    };
+
     AirportTakeFlightBindData(
         stream_factory_produce_t scanner_producer_p,
         const string &trace_id,
@@ -370,6 +377,14 @@ namespace duckdb
     //    std::unique_ptr<AirportTakeFlightParameters> take_flight_params = nullptr;
 
     string json_filters;
+    // FBL-specific features are enabled only after both capability negotiation
+    // and the per-attach rollback switch have allowed them.
+    bool fbl_projection_pushdown = false;
+    bool fbl_exact_filter_pushdown = false;
+    std::vector<std::string> fbl_partial_aggregates;
+    bool require_exact_filters = false;
+    std::vector<FblAggregate> fbl_aggregates;
+    std::vector<idx_t> fbl_scan_column_ids;
 
     idx_t rowid_column_index = COLUMN_IDENTIFIER_ROW_ID;
 
@@ -406,6 +421,15 @@ namespace duckdb
     const std::shared_ptr<arrow::Schema> &schema() const
     {
       return schema_;
+    }
+
+    void set_schema(std::shared_ptr<arrow::Schema> schema)
+    {
+      schema_ = std::move(schema);
+      schema_root = ArrowSchemaWrapper();
+      AIRPORT_ARROW_ASSERT_OK_CONTAINER(
+          ExportSchema(*schema_, &schema_root.arrow_schema), this,
+          "Export aggregate partial schema");
     }
 
     void set_endpoint_count(const size_t endpoint_count)
@@ -484,7 +508,7 @@ namespace duckdb
     const AirportTakeFlightParameters take_flight_params_;
     const std::optional<AirportTableFunctionFlightInfoParameters> table_function_parameters_;
 
-    const std::shared_ptr<arrow::Schema> schema_;
+    std::shared_ptr<arrow::Schema> schema_;
 
     vector<LogicalType> return_types_;
     vector<string> return_names_;

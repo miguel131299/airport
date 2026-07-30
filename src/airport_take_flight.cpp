@@ -532,54 +532,54 @@ namespace duckdb
     return make_uniq<NodeStatistics>();
   }
 
+  static bool AirportIsColumnAndConstant(const Expression &left, const Expression &right)
+  {
+    return left.expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+           right.expression_class == ExpressionClass::BOUND_CONSTANT;
+  }
+
+  bool AirportIsExactFblFilter(const Expression &expression)
+  {
+    switch (expression.expression_class)
+    {
+    case ExpressionClass::BOUND_COMPARISON:
+    {
+      const auto &comparison = expression.Cast<BoundComparisonExpression>();
+      const auto supported_operator =
+          comparison.type == ExpressionType::COMPARE_EQUAL ||
+          comparison.type == ExpressionType::COMPARE_NOTEQUAL ||
+          comparison.type == ExpressionType::COMPARE_LESSTHAN ||
+          comparison.type == ExpressionType::COMPARE_LESSTHANOREQUALTO ||
+          comparison.type == ExpressionType::COMPARE_GREATERTHAN ||
+          comparison.type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+      return supported_operator &&
+             (AirportIsColumnAndConstant(*comparison.left, *comparison.right) ||
+              AirportIsColumnAndConstant(*comparison.right, *comparison.left));
+    }
+    case ExpressionClass::BOUND_BETWEEN:
+    {
+      const auto &between = expression.Cast<BoundBetweenExpression>();
+      return between.input->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+             between.lower->expression_class == ExpressionClass::BOUND_CONSTANT &&
+             between.upper->expression_class == ExpressionClass::BOUND_CONSTANT;
+    }
+    case ExpressionClass::BOUND_CONJUNCTION:
+    {
+      const auto &conjunction = expression.Cast<BoundConjunctionExpression>();
+      if (conjunction.type != ExpressionType::CONJUNCTION_AND || conjunction.children.empty())
+        return false;
+      return std::all_of(conjunction.children.begin(), conjunction.children.end(),
+                         [](const unique_ptr<Expression> &child)
+                         { return AirportIsExactFblFilter(*child); });
+    }
+    default:
+      return false;
+    }
+  }
+
   void AirportTakeFlightComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                               vector<unique_ptr<Expression>> &filters)
   {
-    const auto is_column_and_constant = [](const Expression &left, const Expression &right)
-    {
-      return left.expression_class == ExpressionClass::BOUND_COLUMN_REF &&
-             right.expression_class == ExpressionClass::BOUND_CONSTANT;
-    };
-    std::function<bool(const Expression &)> is_exact_filter;
-    is_exact_filter = [&](const Expression &expression)
-    {
-      switch (expression.expression_class)
-      {
-      case ExpressionClass::BOUND_COMPARISON:
-      {
-        const auto &comparison = expression.Cast<BoundComparisonExpression>();
-        const auto supported_operator =
-            comparison.type == ExpressionType::COMPARE_EQUAL ||
-            comparison.type == ExpressionType::COMPARE_NOTEQUAL ||
-            comparison.type == ExpressionType::COMPARE_LESSTHAN ||
-            comparison.type == ExpressionType::COMPARE_LESSTHANOREQUALTO ||
-            comparison.type == ExpressionType::COMPARE_GREATERTHAN ||
-            comparison.type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
-        return supported_operator &&
-               (is_column_and_constant(*comparison.left, *comparison.right) ||
-                is_column_and_constant(*comparison.right, *comparison.left));
-      }
-      case ExpressionClass::BOUND_BETWEEN:
-      {
-        const auto &between = expression.Cast<BoundBetweenExpression>();
-        return between.input->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
-               between.lower->expression_class == ExpressionClass::BOUND_CONSTANT &&
-               between.upper->expression_class == ExpressionClass::BOUND_CONSTANT;
-      }
-      case ExpressionClass::BOUND_CONJUNCTION:
-      {
-        const auto &conjunction = expression.Cast<BoundConjunctionExpression>();
-        if (conjunction.type != ExpressionType::CONJUNCTION_AND || conjunction.children.empty())
-          return false;
-        return std::all_of(conjunction.children.begin(), conjunction.children.end(),
-                           [&](const unique_ptr<Expression> &child)
-                           { return is_exact_filter(*child); });
-      }
-      default:
-        return false;
-      }
-    };
-
     auto allocator = AirportJSONAllocator(BufferAllocator::Get(context));
 
     auto alc = allocator.GetYYAlc();
@@ -624,15 +624,24 @@ namespace duckdb
 
     auto &bind_data = bind_data_p->Cast<AirportTakeFlightBindData>();
 
-    if (!filters.empty())
-    {
-      bind_data.json_filters = json_result;
-      bind_data.fbl_filters_exact =
-          bind_data.fbl_exact_filter_pushdown &&
-          std::all_of(filters.begin(), filters.end(),
-                      [&](const unique_ptr<Expression> &filter)
-                      { return is_exact_filter(*filter); });
-    }
+    // json_filters and fbl_filters_exact are one snapshot of the filter set as
+    // of the most recent pushdown pass, so they must be overwritten together on
+    // every invocation. This callback is registered on four table functions and
+    // is not idempotent-guarded, while the bind data it writes is owned by the
+    // LogicalGet and read lazily at execution time. Skipping the assignment on
+    // an empty filter vector would leave a previous pass's predicates in
+    // json_filters after the plan stopped carrying them, and the server would
+    // then filter on predicates the query no longer has.
+    bind_data.json_filters = json_result;
+    // all_of is vacuously true on an empty vector. Require a non-empty filter
+    // set explicitly: "exact" authorizes the aggregate rewrite to clear
+    // get.table_filters, which a pass that inspected no filter must never do.
+    bind_data.fbl_filters_exact =
+        bind_data.fbl_exact_filter_pushdown && !filters.empty() &&
+        std::all_of(filters.begin(), filters.end(),
+                    [](const unique_ptr<Expression> &filter)
+                    { return AirportIsExactFblFilter(*filter); });
+
     // Keep normal DuckDB filters as a correctness backstop. The post-optimizer
     // aggregate rewrite removes them only after CSE has seen their distinct
     // constants; clearing here makes query09's five ranges look identical.

@@ -3,6 +3,7 @@
 #include "airport_extension.hpp"
 #include "airport_flight_stream.hpp"
 #include "airport_schema_utils.hpp"
+#include "airport_take_flight.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/function_binder.hpp"
@@ -155,6 +156,13 @@ bool OptimizeAirportAggregate(OptimizerExtensionInput &input, unique_ptr<Logical
 		return false;
 	}
 	auto &bind_data = get.bind_data->Cast<AirportTakeFlightBindData>();
+	// A rewritten plan is Projection -> Aggregate(sum over partials) -> Get, and
+	// that shape re-matches every gate below: sum over the DECIMAL(38, 0) partial
+	// passes IsSupportedAggregateInput. Without this guard a second optimizer
+	// pass over an already-rewritten plan would build partials of partials.
+	if (!bind_data.fbl_aggregates.empty()) {
+		return false;
+	}
 	if (!bind_data.fbl_projection_pushdown || !bind_data.fbl_exact_filter_pushdown) {
 		return false;
 	}
@@ -239,6 +247,17 @@ bool OptimizeAirportAggregate(OptimizerExtensionInput &input, unique_ptr<Logical
 		}
 	}
 
+	// fbl_filters_exact was computed over the vector handed to the filter-pushdown
+	// callback. This residual filter node is a different object, and only the
+	// serialized json_filters travels to the server, so prove these specific
+	// expressions exact before discarding them. Checked last so the common
+	// non-matching plan pays nothing for it.
+	if (residual_filter &&
+	    !std::all_of(residual_filter->expressions.begin(), residual_filter->expressions.end(),
+	                 [](const unique_ptr<Expression> &expression) { return AirportIsExactFblFilter(*expression); })) {
+		return false;
+	}
+
 	bind_data.fbl_aggregates = std::move(specs);
 	bind_data.fbl_scan_column_ids = std::move(source_column_ids);
 	bind_data.require_exact_filters = true;
@@ -247,7 +266,15 @@ bool OptimizeAirportAggregate(OptimizerExtensionInput &input, unique_ptr<Logical
 		// This extension runs after DuckDB's common-subexpression pass. Keeping
 		// the residual until now prevents query09's five BETWEEN ranges from
 		// being deduplicated as identical Airport scans.
-		aggregate.children[0] = std::move(residual_filter->children[0]);
+		//
+		// Move the scan out to a local first: residual_filter points into
+		// aggregate.children[0], so assigning directly would destroy the filter
+		// while reading through it. That ordering happens to be safe, but only
+		// because unique_ptr::operator= releases the source before deleting the
+		// old pointee. Do not rely on it.
+		auto scan = std::move(residual_filter->children[0]);
+		residual_filter = nullptr;
+		aggregate.children[0] = std::move(scan);
 	}
 	bind_data.set_schema(arrow::schema(std::move(partial_fields)));
 	bind_data.arrow_table = AirportArrowTableSchema();

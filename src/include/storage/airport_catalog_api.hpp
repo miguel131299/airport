@@ -214,6 +214,21 @@ namespace duckdb
     const int64_t total_records_;
   };
 
+  struct FblAirportCapabilities
+  {
+    uint32_t version = 0;
+    bool exact_filter_pushdown = false;
+    bool projection_pushdown = false;
+    std::vector<std::string> partial_aggregates;
+
+    MSGPACK_DEFINE_MAP(version, exact_filter_pushdown, projection_pushdown, partial_aggregates)
+
+    bool SupportsPartialAggregate(const string &function_name) const
+    {
+      return std::find(partial_aggregates.begin(), partial_aggregates.end(), function_name) != partial_aggregates.end();
+    }
+  };
+
   struct AirportAPITable : AirportAPIObjectBase
   {
     explicit AirportAPITable(
@@ -229,6 +244,7 @@ namespace duckdb
               parsed_app_metadata,
               total_records)
     {
+      ParseFblCapabilities(parsed_app_metadata);
     }
 
     explicit AirportAPITable(
@@ -241,7 +257,35 @@ namespace duckdb
               location_descriptor.server_location(),
               parsed_app_metadata)
     {
+      ParseFblCapabilities(parsed_app_metadata);
     }
+
+    const FblAirportCapabilities &fbl_capabilities() const
+    {
+      return fbl_capabilities_;
+    }
+
+  private:
+    void ParseFblCapabilities(const AirportSerializedFlightAppMetadata &metadata)
+    {
+      if (!metadata.extra_data.has_value())
+        return;
+      try
+      {
+        auto object = msgpack::unpack(metadata.extra_data->data(), metadata.extra_data->size());
+        FblAirportCapabilities parsed;
+        object.get().convert(parsed);
+        if (parsed.version == 1)
+          fbl_capabilities_ = std::move(parsed);
+      }
+      catch (...)
+      {
+        // Metadata is supplied by arbitrary Flight servers. Unknown or malformed
+        // capability payloads deliberately preserve legacy scan behavior.
+      }
+    }
+
+    FblAirportCapabilities fbl_capabilities_;
   };
 
   struct AirportScalarFunctionExtraInfo

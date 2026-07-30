@@ -14,6 +14,11 @@
 
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "airport_flight_exception.hpp"
 #include "airport_flight_statistics.hpp"
@@ -213,6 +218,18 @@ namespace duckdb
         table_entry,
         nullptr);
 
+    if (table_entry != nullptr)
+    {
+      auto &catalog = table_entry->GetCatalog().Cast<AirportCatalog>();
+      if (catalog.attach_parameters()->fbl_pushdown_enabled())
+      {
+        const auto &capabilities = table_entry->table_data->fbl_capabilities();
+        ret->fbl_projection_pushdown = capabilities.projection_pushdown;
+        ret->fbl_exact_filter_pushdown = capabilities.exact_filter_pushdown;
+        ret->fbl_partial_aggregates = capabilities.partial_aggregates;
+      }
+    }
+
     AirportExamineSchema(context,
                          ret->schema_root,
                          &ret->arrow_table,
@@ -395,9 +412,8 @@ namespace duckdb
     auto &state = data_p.local_state->Cast<AirportArrowScanLocalState>();
     auto &global_state = data_p.global_state->Cast<AirportArrowScanGlobalState>();
     auto &airport_bind_data = data_p.bind_data->CastNoConst<AirportTakeFlightBindData>();
-    auto &reader = state.reader();
 
-    D_ASSERT(!std::holds_alternative<std::shared_ptr<AirportLocalScanData>>(reader));
+    D_ASSERT(!std::holds_alternative<std::shared_ptr<AirportLocalScanData>>(state.reader()));
 
     const auto &array_length = (idx_t)state.chunk->arrow_array.length;
 
@@ -415,7 +431,7 @@ namespace duckdb
       if (output_size > 0)
       {
         ArrowTableFunction::ArrowToDuckDB(state,
-                                          airport_bind_data.arrow_table.GetColumns(),
+                                          state.flight_output_columns(airport_bind_data.arrow_table),
                                           state.all_columns,
                                           false,
                                           airport_bind_data.rowid_column_index);
@@ -428,7 +444,7 @@ namespace duckdb
       if (output_size > 0)
       {
         ArrowTableFunction::ArrowToDuckDB(state,
-                                          airport_bind_data.arrow_table.GetColumns(),
+                                          state.flight_output_columns(airport_bind_data.arrow_table),
                                           output,
                                           false,
                                           airport_bind_data.rowid_column_index);
@@ -516,6 +532,51 @@ namespace duckdb
     return make_uniq<NodeStatistics>();
   }
 
+  static bool AirportIsColumnAndConstant(const Expression &left, const Expression &right)
+  {
+    return left.expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+           right.expression_class == ExpressionClass::BOUND_CONSTANT;
+  }
+
+  bool AirportIsExactFblFilter(const Expression &expression)
+  {
+    switch (expression.expression_class)
+    {
+    case ExpressionClass::BOUND_COMPARISON:
+    {
+      const auto &comparison = expression.Cast<BoundComparisonExpression>();
+      const auto supported_operator =
+          comparison.type == ExpressionType::COMPARE_EQUAL ||
+          comparison.type == ExpressionType::COMPARE_NOTEQUAL ||
+          comparison.type == ExpressionType::COMPARE_LESSTHAN ||
+          comparison.type == ExpressionType::COMPARE_LESSTHANOREQUALTO ||
+          comparison.type == ExpressionType::COMPARE_GREATERTHAN ||
+          comparison.type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+      return supported_operator &&
+             (AirportIsColumnAndConstant(*comparison.left, *comparison.right) ||
+              AirportIsColumnAndConstant(*comparison.right, *comparison.left));
+    }
+    case ExpressionClass::BOUND_BETWEEN:
+    {
+      const auto &between = expression.Cast<BoundBetweenExpression>();
+      return between.input->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+             between.lower->expression_class == ExpressionClass::BOUND_CONSTANT &&
+             between.upper->expression_class == ExpressionClass::BOUND_CONSTANT;
+    }
+    case ExpressionClass::BOUND_CONJUNCTION:
+    {
+      const auto &conjunction = expression.Cast<BoundConjunctionExpression>();
+      if (conjunction.type != ExpressionType::CONJUNCTION_AND || conjunction.children.empty())
+        return false;
+      return std::all_of(conjunction.children.begin(), conjunction.children.end(),
+                         [](const unique_ptr<Expression> &child)
+                         { return AirportIsExactFblFilter(*child); });
+    }
+    default:
+      return false;
+    }
+  }
+
   void AirportTakeFlightComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                               vector<unique_ptr<Expression>> &filters)
   {
@@ -563,7 +624,27 @@ namespace duckdb
 
     auto &bind_data = bind_data_p->Cast<AirportTakeFlightBindData>();
 
+    // json_filters and fbl_filters_exact are one snapshot of the filter set as
+    // of the most recent pushdown pass, so they must be overwritten together on
+    // every invocation. This callback is registered on four table functions and
+    // is not idempotent-guarded, while the bind data it writes is owned by the
+    // LogicalGet and read lazily at execution time. Skipping the assignment on
+    // an empty filter vector would leave a previous pass's predicates in
+    // json_filters after the plan stopped carrying them, and the server would
+    // then filter on predicates the query no longer has.
     bind_data.json_filters = json_result;
+    // all_of is vacuously true on an empty vector. Require a non-empty filter
+    // set explicitly: "exact" authorizes the aggregate rewrite to clear
+    // get.table_filters, which a pass that inspected no filter must never do.
+    bind_data.fbl_filters_exact =
+        bind_data.fbl_exact_filter_pushdown && !filters.empty() &&
+        std::all_of(filters.begin(), filters.end(),
+                    [](const unique_ptr<Expression> &filter)
+                    { return AirportIsExactFblFilter(*filter); });
+
+    // Keep normal DuckDB filters as a correctness backstop. The post-optimizer
+    // aggregate rewrite removes them only after CSE has seen their distinct
+    // constants; clearing here makes query09's five ranges look identical.
   }
 
   shared_ptr<ArrowArrayStreamWrapper> AirportProduceArrowScan(
@@ -632,8 +713,18 @@ namespace duckdb
   {
     struct AirportEndpointParameters
     {
+      struct Aggregate
+      {
+        std::string function;
+        std::optional<idx_t> input_column;
+        MSGPACK_DEFINE_MAP(function, input_column)
+      };
+
       std::string json_filters;
       std::vector<idx_t> column_ids;
+      bool projected_result = false;
+      bool require_exact_filters = false;
+      std::vector<Aggregate> aggregates;
 
       // The parameters to the table function, which should
       // be included in the opaque ticket data returned
@@ -644,7 +735,8 @@ namespace duckdb
       std::string at_unit;
       std::string at_value;
 
-      MSGPACK_DEFINE_MAP(json_filters, column_ids, table_function_parameters, table_function_input_schema, at_unit, at_value)
+      MSGPACK_DEFINE_MAP(json_filters, column_ids, projected_result, require_exact_filters, aggregates,
+                         table_function_parameters, table_function_input_schema, at_unit, at_value)
     };
 
     // static string BuildCompressedTicketMetadata(const string &json_filters, const vector<idx_t> &column_ids, uint32_t *uncompressed_length, const string &location, const flight::FlightDescriptor &descriptor)
@@ -677,7 +769,10 @@ namespace duckdb
         const flight::FlightDescriptor &descriptor,
         const std::shared_ptr<flight::FlightClient> &flight_client,
         const std::string &json_filters,
-        const vector<idx_t> &column_ids,
+        const std::vector<idx_t> &column_ids,
+        bool projected_result,
+        bool require_exact_filters,
+        const std::vector<AirportTakeFlightBindData::FblAggregate> &aggregates,
         const std::string &table_function_parameters,
         const std::string &table_function_input_schema)
     {
@@ -698,6 +793,12 @@ namespace duckdb
 
       endpoints_request.parameters.json_filters = json_filters;
       endpoints_request.parameters.column_ids = column_ids;
+      endpoints_request.parameters.projected_result = projected_result;
+      endpoints_request.parameters.require_exact_filters = require_exact_filters;
+      for (const auto &aggregate : aggregates)
+      {
+        endpoints_request.parameters.aggregates.push_back({aggregate.function, aggregate.input_column});
+      }
       endpoints_request.parameters.table_function_parameters = table_function_parameters;
       endpoints_request.parameters.table_function_input_schema = table_function_input_schema;
       endpoints_request.parameters.at_unit = take_flight_params.at_unit();
@@ -766,13 +867,22 @@ namespace duckdb
       }
     }
 
+    std::vector<idx_t> endpoint_column_ids;
+    if (bind_data.fbl_aggregates.empty())
+      endpoint_column_ids.assign(input.column_ids.begin(), input.column_ids.end());
+    else
+      endpoint_column_ids = bind_data.fbl_scan_column_ids;
+
     auto result = make_uniq<AirportArrowScanGlobalState>(
         AirportGetFlightEndpoints(bind_data.take_flight_params(),
                                   bind_data.trace_id(),
                                   bind_data.descriptor(),
                                   flight_client,
                                   bind_data.json_filters,
-                                  input.column_ids,
+                                  endpoint_column_ids,
+                                  bind_data.fbl_projection_pushdown,
+                                  bind_data.require_exact_filters,
+                                  bind_data.fbl_aggregates,
                                   bind_data.table_function_parameters().has_value() ? bind_data.table_function_parameters()->parameters : "",
                                   bind_data.table_function_parameters().has_value() ? bind_data.table_function_parameters()->table_input_schema : ""),
         projection_ids,
@@ -1026,7 +1136,32 @@ namespace duckdb
                                     stream_result.status().ToString());
           continue;
         }
-        local_state.set_reader(std::move(stream_result).ValueOrDie());
+        auto flight_reader = std::move(stream_result).ValueOrDie();
+        AIRPORT_ASSIGN_OR_RAISE_LOCATION(
+            auto output_schema,
+            flight_reader->GetSchema(),
+            candidate_location.ToString(),
+            "DoGet output schema");
+        ArrowSchemaWrapper output_schema_root;
+        AIRPORT_ARROW_ASSERT_OK_LOCATION(
+            ExportSchema(*output_schema, &output_schema_root.arrow_schema),
+            candidate_location.ToString(),
+            "export DoGet output schema");
+        auto output_arrow_table = make_uniq<AirportArrowTableSchema>();
+        vector<LogicalType> output_types;
+        vector<string> output_names;
+        idx_t output_rowid_column_index = COLUMN_IDENTIFIER_ROW_ID;
+        AirportExamineSchema(context,
+                             output_schema_root,
+                             output_arrow_table.get(),
+                             &output_types,
+                             &output_names,
+                             nullptr,
+                             &output_rowid_column_index,
+                             true);
+        local_state.set_flight_output_schema(std::move(output_schema),
+                                             std::move(output_arrow_table));
+        local_state.set_reader(std::move(flight_reader));
         opened = true;
         break;
       }
@@ -1056,7 +1191,9 @@ namespace duckdb
                                   bind_data.get_progress_counter(0),
                                   // No need for the last metadata message.
                                   nullptr,
-                                  bind_data.schema(),
+                                  local_state.flight_output_schema()
+                                      ? local_state.flight_output_schema()
+                                      : bind_data.schema(),
                                   bind_data,
                                   local_state));
     }
@@ -1066,7 +1203,29 @@ namespace duckdb
       local_state.set_stream(nullptr);
     }
 
-    local_state.column_ids = input.column_ids;
+    if (bind_data.fbl_projection_pushdown &&
+        local_state.flight_output_schema())
+    {
+      // The negotiated Flight stream is already physically narrowed and its
+      // Arrow children are numbered 0..N-1. DuckDB's original column_ids still
+      // refer to positions in the full table schema; passing those into
+      // ArrowToDuckDB indexes beyond the narrow array and reports
+      // "arrow_scan: array length mismatch".
+      local_state.column_ids.clear();
+      local_state.column_ids.reserve(
+          local_state.flight_output_schema()->num_fields());
+      for (idx_t column = 0;
+           column < static_cast<idx_t>(
+                        local_state.flight_output_schema()->num_fields());
+           ++column)
+      {
+        local_state.column_ids.push_back(column);
+      }
+    }
+    else
+    {
+      local_state.column_ids = input.column_ids;
+    }
     local_state.filters = (TableFilterSet *)input.filters.get();
 
     // Projection pushdown is always enabled.

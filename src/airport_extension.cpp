@@ -116,6 +116,7 @@ namespace duckdb
         string auth_token;
         string location;
         idx_t max_endpoints = 1;
+        bool fbl_pushdown_enabled = true;
 
         const auto parse_max_endpoints = [](const string &raw_value) -> idx_t
         {
@@ -130,6 +131,16 @@ namespace duckdb
                                       std::numeric_limits<int>::max());
             }
             return static_cast<idx_t>(parsed);
+        };
+
+        const auto parse_fbl_pushdown = [](const string &raw_value) -> bool
+        {
+            const auto value = StringUtil::Lower(raw_value);
+            if (value == "true" || value == "on" || value == "1")
+                return true;
+            if (value == "false" || value == "off" || value == "0")
+                return false;
+            throw BinderException("Airport FBL_PUSHDOWN must be true/on/1 or false/off/0");
         };
 
         string db_name = info.path;
@@ -154,6 +165,10 @@ namespace duckdb
                 else if (lower_name == "max_endpoints")
                 {
                     max_endpoints = parse_max_endpoints(entry.second);
+                }
+                else if (lower_name == "fbl_pushdown")
+                {
+                    fbl_pushdown_enabled = parse_fbl_pushdown(entry.second);
                 }
                 else
                 {
@@ -186,6 +201,10 @@ namespace duckdb
             {
                 max_endpoints = parse_max_endpoints(entry.second.ToString());
             }
+            else if (lower_name == "fbl_pushdown")
+            {
+                fbl_pushdown_enabled = parse_fbl_pushdown(entry.second.ToString());
+            }
             else
             {
                 throw BinderException("Unrecognized option for Airport ATTACH: %s", entry.first);
@@ -200,7 +219,8 @@ namespace duckdb
         }
 
         return make_uniq<AirportCatalog>(db, db_name, options.access_mode,
-                                         AirportAttachParameters(location, auth_token, secret_name, "", max_endpoints));
+                                         AirportAttachParameters(location, auth_token, secret_name, "", max_endpoints,
+                                                                 fbl_pushdown_enabled));
     }
 
     static unique_ptr<TransactionManager> CreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info, AttachedDatabase &db,

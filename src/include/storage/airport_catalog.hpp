@@ -12,9 +12,9 @@ namespace duckdb
   struct AirportAttachParameters
   {
     AirportAttachParameters(const string &location, const string &auth_token, const string &secret_name, const string &criteria,
-                            idx_t max_endpoints)
+                            idx_t max_endpoints, bool fbl_pushdown_enabled)
         : location_(location), auth_token_(auth_token), secret_name_(secret_name), criteria_(criteria),
-          max_endpoints_(max_endpoints)
+          max_endpoints_(max_endpoints), fbl_pushdown_enabled_(fbl_pushdown_enabled)
     {
     }
 
@@ -43,6 +43,11 @@ namespace duckdb
       return max_endpoints_;
     }
 
+    bool fbl_pushdown_enabled() const
+    {
+      return fbl_pushdown_enabled_;
+    }
+
   private:
     // The location of the flight server.
     string location_;
@@ -54,6 +59,9 @@ namespace duckdb
     string criteria_;
     // Maximum number of Flight endpoints requested for each catalog scan.
     idx_t max_endpoints_;
+    // Allows immediate rollback and benchmark A/B runs without changing the
+    // server. Capability checks still gate every individual optimization.
+    bool fbl_pushdown_enabled_;
   };
 
   class AirportClearCacheFunction : public TableFunction

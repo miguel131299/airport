@@ -117,6 +117,14 @@ namespace duckdb
 
   void AirportTakeFlightComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                               vector<unique_ptr<Expression>> &filters);
+
+  // True when FBL can evaluate `expression` exactly, so a caller may drop its
+  // own residual copy of it. Shared by the filter-pushdown callback (which
+  // records the answer on the bind data) and the aggregate rewrite in
+  // airport_optimizer.cpp (which must re-prove it against the residual filter
+  // node it is about to discard, a different object from the vector the
+  // callback saw).
+  bool AirportIsExactFblFilter(const Expression &expression);
   unique_ptr<NodeStatistics> AirportTakeFlightCardinality(ClientContext &context, const FunctionData *data);
   unique_ptr<BaseStatistics> AirportTakeFlightStatistics(ClientContext &context, const FunctionData *bind_data, column_t column_index);
   double AirportTakeFlightScanProgress(ClientContext &, const FunctionData *data, const GlobalTableFunctionState *global_state);

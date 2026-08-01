@@ -32,12 +32,15 @@
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "msgpack.hpp"
 #include "storage/airport_catalog.hpp"
 #include "storage/airport_table_entry.hpp"
 #include <openssl/bio.h>
+#include <random>
 #include <openssl/evp.h>
 #include "airport_rpc.hpp"
 #include "airport_logging.hpp"
@@ -1292,6 +1295,119 @@ namespace duckdb
     return bind_info;
   }
 
+  // A token identifying this process, minted once per extension load.
+  //
+  // An Airport scan's bind state is only meaningful inside the process that
+  // produced it, so the (de)serialize pair below refuses to revive a plan
+  // anywhere else. A pid would be the obvious token but can be reused after a
+  // restart, which is exactly the case that must not silently succeed.
+  static uint64_t AirportPlanCopyToken()
+  {
+    static const uint64_t token = []()
+    {
+      std::random_device source;
+      return ((uint64_t)source() << 32) ^ (uint64_t)source();
+    }();
+    return token;
+  }
+
+  // Airport bind state cannot be written as bytes: it holds raw pointers into
+  // the local catalog, a live Arrow schema, and pushdown state negotiated with
+  // the server. DuckDB nevertheless routes LogicalOperator::Copy through the
+  // table function's (de)serialize pair, and that copy is entirely in-process --
+  // it serializes to a MemoryStream and deserializes it immediately, with the
+  // source operator alive for the whole round trip.
+  //
+  // Without these callbacks DuckDB falls back to re-binding the scan from
+  // LogicalGet::parameters, which catalog-driven Airport scans never populate.
+  // The rebind then indexes an empty argument vector and the copy dies inside
+  // take_flight_bind_with_pointer. That is what made canonical TPC-DS q95 --
+  // the only query of the 99 that references a CTE twice, and therefore the only
+  // one whose plan gets deep-copied -- fail to run at all.
+  //
+  // So carry the source bind data's address across the round trip and rebuild
+  // from it, guarded by a process token so a plan that escapes this process
+  // raises instead of dereferencing a dangling pointer.
+  static void AirportTakeFlightSerialize(Serializer &serializer,
+                                         const optional_ptr<FunctionData> bind_data_p,
+                                         const TableFunction &function)
+  {
+    if (bind_data_p == nullptr)
+    {
+      throw SerializationException(
+          "airport_take_flight: cannot copy a scan that has no bind data");
+    }
+    serializer.WriteProperty(100, "process_token", AirportPlanCopyToken());
+    serializer.WriteProperty(101, "bind_data_address",
+                             (uint64_t)(uintptr_t)bind_data_p.get());
+  }
+
+  static unique_ptr<FunctionData> AirportTakeFlightDeserialize(Deserializer &deserializer,
+                                                              TableFunction &function)
+  {
+    const auto process_token = deserializer.ReadProperty<uint64_t>(100, "process_token");
+    const auto address = deserializer.ReadProperty<uint64_t>(101, "bind_data_address");
+
+    if (process_token != AirportPlanCopyToken())
+    {
+      throw SerializationException(
+          "airport_take_flight: an Airport scan can only be deserialized in the process that "
+          "serialized it, because its bind state references local catalog objects");
+    }
+
+    auto &source = *reinterpret_cast<AirportTakeFlightBindData *>((uintptr_t)address);
+    auto &context = deserializer.Get<ClientContext &>();
+
+    // AirportTakeFlightBindWithFlightDescriptor ignores its bind input entirely
+    // -- every value it needs is passed explicitly -- so an empty one is enough
+    // to satisfy the signature.
+    vector<Value> parameters;
+    named_parameter_map_t named_parameters;
+    vector<LogicalType> input_table_types;
+    vector<string> input_table_names;
+    TableFunctionRef empty_ref;
+    TableFunctionBindInput bind_input(parameters, named_parameters, input_table_types,
+                                      input_table_names, function.function_info.get(),
+                                      nullptr, function, empty_ref);
+
+    vector<LogicalType> return_types;
+    vector<string> names;
+    // Passing the source's schema keeps this off the network: a non-null schema
+    // skips the GetFlightInfo round trip, so copying a plan costs no RPC.
+    auto result = AirportTakeFlightBindWithFlightDescriptor(
+        source.take_flight_params(),
+        source.descriptor(),
+        context,
+        bind_input,
+        return_types,
+        names,
+        source.schema(),
+        source.estimated_records(),
+        source.table_function_parameters(),
+        source.table_entry());
+
+    auto &copy = result->Cast<AirportTakeFlightBindData>();
+
+    // State the bind itself cannot recompute: filters, projections and
+    // aggregates negotiated during optimization. DuckDB deep-copies plans both
+    // before and after filter pushdown (CTE inlining runs twice), so a copy that
+    // dropped these would silently lose pushdown rather than fail. Any new
+    // mutable field on AirportTakeFlightBindData belongs here too.
+    copy.json_filters = source.json_filters;
+    copy.fbl_projection_pushdown = source.fbl_projection_pushdown;
+    copy.fbl_exact_filter_pushdown = source.fbl_exact_filter_pushdown;
+    copy.fbl_filters_exact = source.fbl_filters_exact;
+    copy.fbl_partial_aggregates = source.fbl_partial_aggregates;
+    copy.require_exact_filters = source.require_exact_filters;
+    copy.fbl_aggregates = source.fbl_aggregates;
+    copy.fbl_scan_column_ids = source.fbl_scan_column_ids;
+    copy.rowid_column_index = source.rowid_column_index;
+    copy.skip_producing_result_for_update_or_delete =
+        source.skip_producing_result_for_update_or_delete;
+
+    return result;
+  }
+
   void AirportAddTakeFlightFunction(ExtensionLoader &loader)
   {
     auto take_flight_function_set = TableFunctionSet("airport_take_flight");
@@ -1319,6 +1435,9 @@ namespace duckdb
     take_flight_function_with_descriptor.projection_pushdown = true;
     take_flight_function_with_descriptor.filter_pushdown = false;
     take_flight_function_with_descriptor.table_scan_progress = AirportTakeFlightScanProgress;
+    // Required for LogicalOperator::Copy; see AirportTakeFlightSerialize.
+    take_flight_function_with_descriptor.serialize = AirportTakeFlightSerialize;
+    take_flight_function_with_descriptor.deserialize = AirportTakeFlightDeserialize;
     take_flight_function_set.AddFunction(take_flight_function_with_descriptor);
 
     auto take_flight_function_with_pointer = TableFunction(
@@ -1346,6 +1465,11 @@ namespace duckdb
     take_flight_function_with_pointer.statistics = AirportTakeFlightStatistics;
     take_flight_function_with_pointer.get_bind_info = AirportTakeFlightGetBindInfo;
     take_flight_function_with_pointer.to_string = AirportTakeFlightToString;
+    // Required for LogicalOperator::Copy; see AirportTakeFlightSerialize. This
+    // is the variant catalog tables bind through, and the one canonical TPC-DS
+    // q95 used to fail on.
+    take_flight_function_with_pointer.serialize = AirportTakeFlightSerialize;
+    take_flight_function_with_pointer.deserialize = AirportTakeFlightDeserialize;
 
     take_flight_function_set.AddFunction(take_flight_function_with_pointer);
 

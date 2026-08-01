@@ -31,6 +31,7 @@
 #include "airport_take_flight.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/arrow/schema_metadata.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -40,7 +41,9 @@
 #include "storage/airport_catalog.hpp"
 #include "storage/airport_table_entry.hpp"
 #include <openssl/bio.h>
+#include <mutex>
 #include <random>
+#include <unordered_map>
 #include <openssl/evp.h>
 #include "airport_rpc.hpp"
 #include "airport_logging.hpp"
@@ -1311,6 +1314,95 @@ namespace duckdb
     return token;
   }
 
+  // The serializer callbacks are also reachable through persistent serializers
+  // such as json_serialize_plan. Airport bind state is deliberately not
+  // persistable: it contains a live catalog entry and Arrow objects owned by
+  // this DuckDB process. Keep an owned, one-shot snapshot for DuckDB's binary
+  // in-process plan copy instead of putting a live object's address in the
+  // serialized stream.
+  struct AirportPlanCopySnapshot
+  {
+    explicit AirportPlanCopySnapshot(const AirportTakeFlightBindData &source)
+        : take_flight_params(source.take_flight_params()),
+          descriptor(source.descriptor()),
+          schema(source.schema()),
+          estimated_records(source.estimated_records()),
+          table_function_parameters(source.table_function_parameters()),
+          table_entry(source.table_entry()),
+          json_filters(source.json_filters),
+          fbl_projection_pushdown(source.fbl_projection_pushdown),
+          fbl_exact_filter_pushdown(source.fbl_exact_filter_pushdown),
+          fbl_filters_exact(source.fbl_filters_exact),
+          fbl_partial_aggregates(source.fbl_partial_aggregates),
+          require_exact_filters(source.require_exact_filters),
+          fbl_aggregates(source.fbl_aggregates),
+          fbl_scan_column_ids(source.fbl_scan_column_ids),
+          rowid_column_index(source.rowid_column_index),
+          skip_producing_result_for_update_or_delete(
+              source.skip_producing_result_for_update_or_delete)
+    {
+    }
+
+    AirportTakeFlightParameters take_flight_params;
+    flight::FlightDescriptor descriptor;
+    std::shared_ptr<arrow::Schema> schema;
+    int64_t estimated_records;
+    std::optional<AirportTableFunctionFlightInfoParameters> table_function_parameters;
+    const AirportTableEntry *table_entry;
+    string json_filters;
+    bool fbl_projection_pushdown;
+    bool fbl_exact_filter_pushdown;
+    bool fbl_filters_exact;
+    std::vector<std::string> fbl_partial_aggregates;
+    bool require_exact_filters;
+    std::vector<AirportTakeFlightBindData::FblAggregate> fbl_aggregates;
+    std::vector<idx_t> fbl_scan_column_ids;
+    idx_t rowid_column_index;
+    bool skip_producing_result_for_update_or_delete;
+  };
+
+  static std::mutex &AirportPlanCopyMutex()
+  {
+    static std::mutex mutex;
+    return mutex;
+  }
+
+  static std::unordered_map<uint64_t, std::unique_ptr<AirportPlanCopySnapshot>> &
+  AirportPlanCopySnapshots()
+  {
+    static std::unordered_map<uint64_t, std::unique_ptr<AirportPlanCopySnapshot>> snapshots;
+    return snapshots;
+  }
+
+  static uint64_t AirportRegisterPlanCopy(const AirportTakeFlightBindData &source)
+  {
+    std::random_device random;
+    std::lock_guard<std::mutex> guard(AirportPlanCopyMutex());
+    auto &snapshots = AirportPlanCopySnapshots();
+    uint64_t handle;
+    do
+    {
+      handle = ((uint64_t)random() << 32) ^ (uint64_t)random();
+    } while (handle == 0 || snapshots.find(handle) != snapshots.end());
+    snapshots.emplace(handle, std::make_unique<AirportPlanCopySnapshot>(source));
+    return handle;
+  }
+
+  static std::unique_ptr<AirportPlanCopySnapshot> AirportTakePlanCopy(uint64_t handle)
+  {
+    std::lock_guard<std::mutex> guard(AirportPlanCopyMutex());
+    auto &snapshots = AirportPlanCopySnapshots();
+    auto entry = snapshots.find(handle);
+    if (entry == snapshots.end())
+    {
+      throw SerializationException(
+          "airport_take_flight: plan-copy state is missing or has already been consumed");
+    }
+    auto snapshot = std::move(entry->second);
+    snapshots.erase(entry);
+    return snapshot;
+  }
+
   // Airport bind state cannot be written as bytes: it holds raw pointers into
   // the local catalog, a live Arrow schema, and pushdown state negotiated with
   // the server. DuckDB nevertheless routes LogicalOperator::Copy through the
@@ -1325,9 +1417,10 @@ namespace duckdb
   // the only query of the 99 that references a CTE twice, and therefore the only
   // one whose plan gets deep-copied -- fail to run at all.
   //
-  // So carry the source bind data's address across the round trip and rebuild
-  // from it, guarded by a process token so a plan that escapes this process
-  // raises instead of dereferencing a dangling pointer.
+  // So register an owned one-shot snapshot, carry only its opaque handle across
+  // the round trip, and reject non-binary serializers before any state is
+  // registered. The process token also makes a copied stream fail clearly if
+  // it somehow reaches another process.
   static void AirportTakeFlightSerialize(Serializer &serializer,
                                          const optional_ptr<FunctionData> bind_data_p,
                                          const TableFunction &function)
@@ -1337,16 +1430,22 @@ namespace duckdb
       throw SerializationException(
           "airport_take_flight: cannot copy a scan that has no bind data");
     }
+    if (dynamic_cast<BinarySerializer *>(&serializer) == nullptr)
+    {
+      throw SerializationException(
+          "airport_take_flight: Airport scans only support DuckDB's in-process binary plan copy");
+    }
     serializer.WriteProperty(100, "process_token", AirportPlanCopyToken());
-    serializer.WriteProperty(101, "bind_data_address",
-                             (uint64_t)(uintptr_t)bind_data_p.get());
+    serializer.WriteProperty(
+        101, "plan_copy_handle",
+        AirportRegisterPlanCopy(bind_data_p->Cast<AirportTakeFlightBindData>()));
   }
 
   static unique_ptr<FunctionData> AirportTakeFlightDeserialize(Deserializer &deserializer,
                                                               TableFunction &function)
   {
     const auto process_token = deserializer.ReadProperty<uint64_t>(100, "process_token");
-    const auto address = deserializer.ReadProperty<uint64_t>(101, "bind_data_address");
+    const auto handle = deserializer.ReadProperty<uint64_t>(101, "plan_copy_handle");
 
     if (process_token != AirportPlanCopyToken())
     {
@@ -1355,7 +1454,7 @@ namespace duckdb
           "serialized it, because its bind state references local catalog objects");
     }
 
-    auto &source = *reinterpret_cast<AirportTakeFlightBindData *>((uintptr_t)address);
+    auto source = AirportTakePlanCopy(handle);
     auto &context = deserializer.Get<ClientContext &>();
 
     // AirportTakeFlightBindWithFlightDescriptor ignores its bind input entirely
@@ -1375,16 +1474,16 @@ namespace duckdb
     // Passing the source's schema keeps this off the network: a non-null schema
     // skips the GetFlightInfo round trip, so copying a plan costs no RPC.
     auto result = AirportTakeFlightBindWithFlightDescriptor(
-        source.take_flight_params(),
-        source.descriptor(),
+        source->take_flight_params,
+        source->descriptor,
         context,
         bind_input,
         return_types,
         names,
-        source.schema(),
-        source.estimated_records(),
-        source.table_function_parameters(),
-        source.table_entry());
+        source->schema,
+        source->estimated_records,
+        source->table_function_parameters,
+        source->table_entry);
 
     auto &copy = result->Cast<AirportTakeFlightBindData>();
 
@@ -1393,17 +1492,17 @@ namespace duckdb
     // before and after filter pushdown (CTE inlining runs twice), so a copy that
     // dropped these would silently lose pushdown rather than fail. Any new
     // mutable field on AirportTakeFlightBindData belongs here too.
-    copy.json_filters = source.json_filters;
-    copy.fbl_projection_pushdown = source.fbl_projection_pushdown;
-    copy.fbl_exact_filter_pushdown = source.fbl_exact_filter_pushdown;
-    copy.fbl_filters_exact = source.fbl_filters_exact;
-    copy.fbl_partial_aggregates = source.fbl_partial_aggregates;
-    copy.require_exact_filters = source.require_exact_filters;
-    copy.fbl_aggregates = source.fbl_aggregates;
-    copy.fbl_scan_column_ids = source.fbl_scan_column_ids;
-    copy.rowid_column_index = source.rowid_column_index;
+    copy.json_filters = source->json_filters;
+    copy.fbl_projection_pushdown = source->fbl_projection_pushdown;
+    copy.fbl_exact_filter_pushdown = source->fbl_exact_filter_pushdown;
+    copy.fbl_filters_exact = source->fbl_filters_exact;
+    copy.fbl_partial_aggregates = source->fbl_partial_aggregates;
+    copy.require_exact_filters = source->require_exact_filters;
+    copy.fbl_aggregates = source->fbl_aggregates;
+    copy.fbl_scan_column_ids = source->fbl_scan_column_ids;
+    copy.rowid_column_index = source->rowid_column_index;
     copy.skip_producing_result_for_update_or_delete =
-        source.skip_producing_result_for_update_or_delete;
+        source->skip_producing_result_for_update_or_delete;
 
     return result;
   }

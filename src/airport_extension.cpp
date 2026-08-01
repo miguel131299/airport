@@ -20,7 +20,7 @@
 #include <charconv>
 #include <limits>
 
-#define AIRPORT_EXTENSION_VERSION "2026010801"
+#define AIRPORT_EXTENSION_VERSION "2026080101"
 
 namespace duckdb
 {

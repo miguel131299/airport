@@ -13,10 +13,12 @@ namespace duckdb
   {
     AirportAttachParameters(const string &location, const string &auth_token, const string &secret_name, const string &criteria,
                             idx_t max_endpoints, bool fbl_pushdown_enabled,
-                            bool fbl_hint_filters_enabled = true, const string &ipc_compression = "")
+                            bool fbl_hint_filters_enabled = true, const string &ipc_compression = "",
+                            bool fbl_narrow_decimals_enabled = true)
         : location_(location), auth_token_(auth_token), secret_name_(secret_name), criteria_(criteria),
           max_endpoints_(max_endpoints), fbl_pushdown_enabled_(fbl_pushdown_enabled),
-          fbl_hint_filters_enabled_(fbl_hint_filters_enabled), ipc_compression_(ipc_compression)
+          fbl_hint_filters_enabled_(fbl_hint_filters_enabled), ipc_compression_(ipc_compression),
+          fbl_narrow_decimals_enabled_(fbl_narrow_decimals_enabled)
     {
     }
 
@@ -60,6 +62,11 @@ namespace duckdb
       return ipc_compression_;
     }
 
+    bool fbl_narrow_decimals_enabled() const
+    {
+      return fbl_narrow_decimals_enabled_;
+    }
+
   private:
     // The location of the flight server.
     string location_;
@@ -81,6 +88,10 @@ namespace duckdb
     // Requested DoGet IPC body compression ("" = none, "lz4", "zstd"),
     // forwarded as x-fbl-ipc-compression. Arrow decompresses transparently.
     string ipc_compression_;
+    // Asks a capable server to advertise and ship decimals of precision <= 18
+    // as decimal32/decimal64 (x-fbl-narrow-decimals), which DuckDB imports
+    // without a per-value cast.
+    bool fbl_narrow_decimals_enabled_;
   };
 
   class AirportClearCacheFunction : public TableFunction

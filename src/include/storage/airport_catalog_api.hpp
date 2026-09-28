@@ -223,8 +223,11 @@ namespace duckdb
     // The server accepts AirportEndpointParameters.hint_filters: optional,
     // never-exact row filters derived from DuckDB's runtime join filters.
     bool hint_filters = false;
+    // The server honors x-fbl-narrow-decimals on GetFlightInfo and DoGet.
+    bool narrow_decimals = false;
 
-    MSGPACK_DEFINE_MAP(version, exact_filter_pushdown, projection_pushdown, partial_aggregates, hint_filters)
+    MSGPACK_DEFINE_MAP(version, exact_filter_pushdown, projection_pushdown, partial_aggregates, hint_filters,
+                       narrow_decimals)
 
     bool SupportsPartialAggregate(const string &function_name) const
     {

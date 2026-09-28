@@ -96,6 +96,36 @@ namespace duckdb
     }
   }
 
+  // The FBL server's narrow-decimal rule (x-fbl-narrow-decimals): top-level
+  // decimal128 fields of precision <= 9 become decimal32, <= 18 decimal64.
+  static std::shared_ptr<arrow::Schema> AirportNarrowDecimalSchema(const std::shared_ptr<arrow::Schema> &schema)
+  {
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    fields.reserve(schema->num_fields());
+    bool changed = false;
+    for (const auto &field : schema->fields())
+    {
+      if (field->type()->id() == arrow::Type::DECIMAL128)
+      {
+        const auto &decimal = static_cast<const arrow::Decimal128Type &>(*field->type());
+        if (decimal.precision() <= 9)
+        {
+          fields.push_back(field->WithType(arrow::decimal32(decimal.precision(), decimal.scale())));
+          changed = true;
+          continue;
+        }
+        if (decimal.precision() <= 18)
+        {
+          fields.push_back(field->WithType(arrow::decimal64(decimal.precision(), decimal.scale())));
+          changed = true;
+          continue;
+        }
+      }
+      fields.push_back(field);
+    }
+    return changed ? arrow::schema(std::move(fields), schema->metadata()) : schema;
+  }
+
   unique_ptr<FunctionData>
   AirportTakeFlightBindWithFlightDescriptor(
       const AirportTakeFlightParameters &take_flight_params,
@@ -313,6 +343,20 @@ namespace duckdb
       params.add_header("x-fbl-ipc-compression",
                         airport_catalog.attach_parameters()->ipc_compression());
     }
+    // Narrow decimals: a capable server ships decimals of precision <= 9 / 18
+    // as decimal32 / decimal64 on every DoGet that carries this header, so
+    // the schema this scan binds (the catalog's cached one below) must use
+    // the same widths. The DuckDB types stay DECIMAL(p, s) either way; only
+    // the Arrow import changes, to a zero-copy one.
+    auto bind_schema = info->schema();
+    if (airport_catalog.attach_parameters()->fbl_pushdown_enabled() &&
+        airport_catalog.attach_parameters()->fbl_narrow_decimals_enabled() &&
+        table_entry->table_data->fbl_capabilities().narrow_decimals &&
+        bind_schema != nullptr)
+    {
+      params.add_header("x-fbl-narrow-decimals", "1");
+      bind_schema = AirportNarrowDecimalSchema(bind_schema);
+    }
 
     // The transaction identifier is passed as the 2nd argument.
     if (!input.inputs[2].IsNull())
@@ -331,7 +375,7 @@ namespace duckdb
         input,
         return_types,
         names,
-        info->schema(),
+        bind_schema,
         info->total_records(),
         std::nullopt,
         table_entry);

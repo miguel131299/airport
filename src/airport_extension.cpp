@@ -119,6 +119,7 @@ namespace duckdb
         bool fbl_pushdown_enabled = true;
         bool fbl_hint_filters_enabled = true;
         string ipc_compression;
+        bool fbl_narrow_decimals_enabled = true;
 
         const auto parse_max_endpoints = [](const string &raw_value) -> idx_t
         {
@@ -153,6 +154,16 @@ namespace duckdb
             if (value == "false" || value == "off" || value == "0")
                 return false;
             throw BinderException("Airport FBL_HINT_FILTERS must be true/on/1 or false/off/0");
+        };
+
+        const auto parse_fbl_narrow_decimals = [](const string &raw_value) -> bool
+        {
+            const auto value = StringUtil::Lower(raw_value);
+            if (value == "true" || value == "on" || value == "1")
+                return true;
+            if (value == "false" || value == "off" || value == "0")
+                return false;
+            throw BinderException("Airport FBL_NARROW_DECIMALS must be true/on/1 or false/off/0");
         };
 
         const auto parse_ipc_compression = [](const string &raw_value) -> string
@@ -202,6 +213,10 @@ namespace duckdb
                 {
                     ipc_compression = parse_ipc_compression(entry.second);
                 }
+                else if (lower_name == "fbl_narrow_decimals")
+                {
+                    fbl_narrow_decimals_enabled = parse_fbl_narrow_decimals(entry.second);
+                }
                 else
                 {
                     throw BinderException("Unrecognized option for Airport ATTACH: %s", entry.first);
@@ -245,6 +260,10 @@ namespace duckdb
             {
                 ipc_compression = parse_ipc_compression(entry.second.ToString());
             }
+            else if (lower_name == "fbl_narrow_decimals")
+            {
+                fbl_narrow_decimals_enabled = parse_fbl_narrow_decimals(entry.second.ToString());
+            }
             else
             {
                 throw BinderException("Unrecognized option for Airport ATTACH: %s", entry.first);
@@ -261,7 +280,7 @@ namespace duckdb
         return make_uniq<AirportCatalog>(db, db_name, options.access_mode,
                                          AirportAttachParameters(location, auth_token, secret_name, "", max_endpoints,
                                                                  fbl_pushdown_enabled, fbl_hint_filters_enabled,
-                                                                 ipc_compression));
+                                                                 ipc_compression, fbl_narrow_decimals_enabled));
     }
 
     static unique_ptr<TransactionManager> CreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info, AttachedDatabase &db,

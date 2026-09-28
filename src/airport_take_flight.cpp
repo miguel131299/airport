@@ -251,9 +251,10 @@ namespace duckdb
     // Store the return types and names so they can be
     // validated by parquet_scans or other scans used in endpoints.
     ret->set_types_and_names(return_types, names);
-    // AirportArrowScanInitGlobal reads all_types for the scanned columns once
-    // projection_ids is populated, which filter_prune makes the normal case.
-    // The aggregate rewrite replaces it together with the partial schema.
+    // AirportArrowScanInitGlobal reads all_types for the scanned columns when
+    // projection_ids is populated, and the static-filter expression types its
+    // column references from it. The aggregate rewrite replaces it together
+    // with the partial schema.
     ret->all_types = return_types;
 
     return ret;
@@ -1745,10 +1746,11 @@ namespace duckdb
     take_flight_function_with_descriptor.projection_pushdown = true;
     // Filter pushdown lets DuckDB's join-filter optimizer target Airport scans
     // (see AirportSerializeHintFilters). Pushed static filters are enforced
-    // by the scan itself (AirportBuildStaticFilterExpression), and filter_prune
-    // lets filter-only columns stay out of the scan's output.
+    // by the scan itself (AirportBuildStaticFilterExpression). filter_prune
+    // stays off: with it, multi-endpoint scans (MAX_ENDPOINTS > 1) produced
+    // chunks narrower than the scan's column layout (TPC-DS q4 at SF1).
     take_flight_function_with_descriptor.filter_pushdown = true;
-    take_flight_function_with_descriptor.filter_prune = true;
+    take_flight_function_with_descriptor.filter_prune = false;
     take_flight_function_with_descriptor.table_scan_progress = AirportTakeFlightScanProgress;
     // Required for LogicalOperator::Copy; see AirportTakeFlightSerialize.
     take_flight_function_with_descriptor.serialize = AirportTakeFlightSerialize;
@@ -1777,10 +1779,11 @@ namespace duckdb
     take_flight_function_with_pointer.projection_pushdown = true;
     // Filter pushdown lets DuckDB's join-filter optimizer target Airport scans
     // (see AirportSerializeHintFilters). Pushed static filters are enforced
-    // by the scan itself (AirportBuildStaticFilterExpression), and filter_prune
-    // lets filter-only columns stay out of the scan's output.
+    // by the scan itself (AirportBuildStaticFilterExpression). filter_prune
+    // stays off: with it, multi-endpoint scans (MAX_ENDPOINTS > 1) produced
+    // chunks narrower than the scan's column layout (TPC-DS q4 at SF1).
     take_flight_function_with_pointer.filter_pushdown = true;
-    take_flight_function_with_pointer.filter_prune = true;
+    take_flight_function_with_pointer.filter_prune = false;
     take_flight_function_with_pointer.table_scan_progress = AirportTakeFlightScanProgress;
     take_flight_function_with_pointer.statistics = AirportTakeFlightStatistics;
     take_flight_function_with_pointer.get_bind_info = AirportTakeFlightGetBindInfo;

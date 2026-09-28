@@ -1329,14 +1329,19 @@ namespace duckdb
         auto candidate_client = AirportAPI::FlightClientForLocation(bind_data.server_location());
         if (candidate_location != flight::Location::ReuseConnection())
         {
-          auto connect_result = flight::FlightClient::Connect(candidate_location);
-          if (!connect_result.ok())
+          // The per-location client cache, not a fresh Connect: a new client
+          // is a new gRPC channel (TCP + HTTP/2 handshake, then teardown) for
+          // every endpoint of every scan, a fixed cost that dominated small
+          // scans. gRPC channels are safe for concurrent calls.
+          try
           {
-            location_errors.push_back(candidate_location.ToString() + ": connect: " +
-                                      connect_result.status().ToString());
+            candidate_client = AirportAPI::FlightClientForLocation(candidate_location.ToString());
+          }
+          catch (const std::exception &e)
+          {
+            location_errors.push_back(candidate_location.ToString() + ": connect: " + e.what());
             continue;
           }
-          candidate_client = std::move(connect_result).ValueOrDie();
         }
 
         auto stream_result = candidate_client->DoGet(call_options, endpoint.ticket);

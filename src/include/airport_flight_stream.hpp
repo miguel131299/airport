@@ -20,6 +20,7 @@
 #include "airport_macros.hpp"
 
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "storage/airport_table_entry.hpp"
@@ -350,6 +351,15 @@ namespace duckdb
 
     bool done = false;
 
+    // Static table filters DuckDB pushed into this scan (filter_pushdown),
+    // compiled over the column_ids layout. Null when the scan has none. The
+    // server only prunes with these, so the scan must enforce them exactly,
+    // like any DuckDB scan that accepts filter pushdown.
+    // ExpressionExecutor only references its expression, so the state owns it.
+    unique_ptr<Expression> static_filter_expression;
+    unique_ptr<ExpressionExecutor> static_filter_executor;
+    SelectionVector static_filter_sel{STANDARD_VECTOR_SIZE};
+
   private:
     ReaderDelegate reader_;
 
@@ -401,6 +411,9 @@ namespace duckdb
     bool fbl_projection_pushdown = false;
     bool fbl_exact_filter_pushdown = false;
     bool fbl_filters_exact = false;
+    // Send DuckDB's runtime join filters to the server as optional row-filter
+    // hints (see AirportSerializeHintFilters). Negotiated like the fields above.
+    bool fbl_hint_filters = false;
     std::vector<std::string> fbl_partial_aggregates;
     bool require_exact_filters = false;
     std::vector<FblAggregate> fbl_aggregates;

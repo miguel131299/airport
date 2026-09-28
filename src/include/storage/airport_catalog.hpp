@@ -12,9 +12,11 @@ namespace duckdb
   struct AirportAttachParameters
   {
     AirportAttachParameters(const string &location, const string &auth_token, const string &secret_name, const string &criteria,
-                            idx_t max_endpoints, bool fbl_pushdown_enabled)
+                            idx_t max_endpoints, bool fbl_pushdown_enabled,
+                            bool fbl_hint_filters_enabled = true, const string &ipc_compression = "")
         : location_(location), auth_token_(auth_token), secret_name_(secret_name), criteria_(criteria),
-          max_endpoints_(max_endpoints), fbl_pushdown_enabled_(fbl_pushdown_enabled)
+          max_endpoints_(max_endpoints), fbl_pushdown_enabled_(fbl_pushdown_enabled),
+          fbl_hint_filters_enabled_(fbl_hint_filters_enabled), ipc_compression_(ipc_compression)
     {
     }
 
@@ -48,6 +50,16 @@ namespace duckdb
       return fbl_pushdown_enabled_;
     }
 
+    bool fbl_hint_filters_enabled() const
+    {
+      return fbl_hint_filters_enabled_;
+    }
+
+    const string &ipc_compression() const
+    {
+      return ipc_compression_;
+    }
+
   private:
     // The location of the flight server.
     string location_;
@@ -62,6 +74,13 @@ namespace duckdb
     // Allows immediate rollback and benchmark A/B runs without changing the
     // server. Capability checks still gate every individual optimization.
     bool fbl_pushdown_enabled_;
+    // Sends DuckDB's runtime join filters (min/max, IN lists) to the server as
+    // optional scan hints. Separate from FBL_PUSHDOWN so the hints can be A/B
+    // measured on their own; the server's capability bit still gates them.
+    bool fbl_hint_filters_enabled_;
+    // Requested DoGet IPC body compression ("" = none, "lz4", "zstd"),
+    // forwarded as x-fbl-ipc-compression. Arrow decompresses transparently.
+    string ipc_compression_;
   };
 
   class AirportClearCacheFunction : public TableFunction

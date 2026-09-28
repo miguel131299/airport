@@ -220,8 +220,11 @@ namespace duckdb
     bool exact_filter_pushdown = false;
     bool projection_pushdown = false;
     std::vector<std::string> partial_aggregates;
+    // The server accepts AirportEndpointParameters.hint_filters: optional,
+    // never-exact row filters derived from DuckDB's runtime join filters.
+    bool hint_filters = false;
 
-    MSGPACK_DEFINE_MAP(version, exact_filter_pushdown, projection_pushdown, partial_aggregates)
+    MSGPACK_DEFINE_MAP(version, exact_filter_pushdown, projection_pushdown, partial_aggregates, hint_filters)
 
     bool SupportsPartialAggregate(const string &function_name) const
     {

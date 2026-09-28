@@ -20,7 +20,7 @@
 #include <charconv>
 #include <limits>
 
-#define AIRPORT_EXTENSION_VERSION "2026080102"
+#define AIRPORT_EXTENSION_VERSION "2026092801"
 
 namespace duckdb
 {
@@ -117,6 +117,8 @@ namespace duckdb
         string location;
         idx_t max_endpoints = 1;
         bool fbl_pushdown_enabled = true;
+        bool fbl_hint_filters_enabled = true;
+        string ipc_compression;
 
         const auto parse_max_endpoints = [](const string &raw_value) -> idx_t
         {
@@ -141,6 +143,28 @@ namespace duckdb
             if (value == "false" || value == "off" || value == "0")
                 return false;
             throw BinderException("Airport FBL_PUSHDOWN must be true/on/1 or false/off/0");
+        };
+
+        const auto parse_fbl_hint_filters = [](const string &raw_value) -> bool
+        {
+            const auto value = StringUtil::Lower(raw_value);
+            if (value == "true" || value == "on" || value == "1")
+                return true;
+            if (value == "false" || value == "off" || value == "0")
+                return false;
+            throw BinderException("Airport FBL_HINT_FILTERS must be true/on/1 or false/off/0");
+        };
+
+        const auto parse_ipc_compression = [](const string &raw_value) -> string
+        {
+            const auto value = StringUtil::Lower(raw_value);
+            if (value.empty() || value == "none")
+                return "";
+            if (value == "lz4" || value == "lz4_frame")
+                return "lz4";
+            if (value == "zstd")
+                return "zstd";
+            throw BinderException("Airport IPC_COMPRESSION must be none, lz4 or zstd");
         };
 
         string db_name = info.path;
@@ -169,6 +193,14 @@ namespace duckdb
                 else if (lower_name == "fbl_pushdown")
                 {
                     fbl_pushdown_enabled = parse_fbl_pushdown(entry.second);
+                }
+                else if (lower_name == "fbl_hint_filters")
+                {
+                    fbl_hint_filters_enabled = parse_fbl_hint_filters(entry.second);
+                }
+                else if (lower_name == "ipc_compression")
+                {
+                    ipc_compression = parse_ipc_compression(entry.second);
                 }
                 else
                 {
@@ -205,6 +237,14 @@ namespace duckdb
             {
                 fbl_pushdown_enabled = parse_fbl_pushdown(entry.second.ToString());
             }
+            else if (lower_name == "fbl_hint_filters")
+            {
+                fbl_hint_filters_enabled = parse_fbl_hint_filters(entry.second.ToString());
+            }
+            else if (lower_name == "ipc_compression")
+            {
+                ipc_compression = parse_ipc_compression(entry.second.ToString());
+            }
             else
             {
                 throw BinderException("Unrecognized option for Airport ATTACH: %s", entry.first);
@@ -220,7 +260,8 @@ namespace duckdb
 
         return make_uniq<AirportCatalog>(db, db_name, options.access_mode,
                                          AirportAttachParameters(location, auth_token, secret_name, "", max_endpoints,
-                                                                 fbl_pushdown_enabled));
+                                                                 fbl_pushdown_enabled, fbl_hint_filters_enabled,
+                                                                 ipc_compression));
     }
 
     static unique_ptr<TransactionManager> CreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info, AttachedDatabase &db,
